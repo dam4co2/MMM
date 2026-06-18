@@ -1,0 +1,247 @@
+# %% Imports
+import sys
+sys.path.insert(0, "..")
+
+from src.logging_utils import Tee
+_log = Tee("../results/00_preprocessing.txt")
+
+import numpy as np
+import pandas as pd
+
+from src.data_dicts import polymer_to_smiles_sat, MOF_to_M, mof_to_csd, csd_to_descriptors
+
+from src.preprocessing import (
+    load_raw_database,
+    clean_raw_data,
+    add_mof_descriptors,
+    drop_sparse_columns,
+    fill_all_metals,
+    label_encode_categoricals,
+    selective_mice_imputation,
+    process_mof_database,
+)
+
+# %% Load raw database
+print("=" * 60)
+print("STEP 1 — Load raw database")
+print("=" * 60)
+
+df = load_raw_database("../data/database_raw.csv", sep=";")
+print(f"Shape: {df.shape}")
+print(f"Columns: {df.columns.tolist()}")
+
+# %% Clean raw data
+print("\n" + "=" * 60)
+print("STEP 2 — Clean raw data")
+print("=" * 60)
+print("  Fixing polymer_type entries, missing MOF names,")
+print("  comma-decimal numeric columns, and loading format...")
+
+df = clean_raw_data(df)
+print(f"Shape after cleaning: {df.shape}")
+
+# %% Process MOF databank and add descriptors
+print("\n" + "=" * 60)
+print("STEP 3 — Process CoRE-MOF databank and add descriptors")
+print("=" * 60)
+
+process_mof_database("../data/MOF_databank.csv", csd_to_descriptors)
+
+df = add_mof_descriptors(df, csd_to_descriptors, mof_to_csd)
+print(f"Shape after adding MOF descriptors: {df.shape}")
+
+# Reorder: move CP, CS, RP, RS to the end
+print("\n  Reordering columns: moving CP, CS, RP, RS to the end...")
+target_cols = ["CP", "CS", "RP", "RS"]
+other_cols = [c for c in df.columns if c not in target_cols]
+df = df[other_cols + target_cols]
+print(f"Shape after reorder: {df.shape}")
+
+# %% Drop sparse columns
+print("\n" + "=" * 60)
+print("STEP 4 — Drop sparse columns (< 20% data present)")
+print("=" * 60)
+
+df = drop_sparse_columns(df, min_present_fraction=0.2)
+print(f"Shape after dropping sparse columns: {df.shape}")
+
+# %% Fill All_Metals
+print("\n" + "=" * 60)
+print("STEP 5 — Fill missing All_Metals values")
+print("=" * 60)
+
+df = fill_all_metals(df, MOF_to_M)
+print(f"Shape: {df.shape}")
+
+# %% Drop node_SMILES column
+print("\n" + "=" * 60)
+print("STEP 6 — Drop node_SMILES column")
+print("=" * 60)
+
+if "node_SMILES" in df.columns:
+    df = df.drop(columns=["node_SMILES"])
+    print("  Dropped 'node_SMILES'.")
+else:
+    print("  'node_SMILES' not found — skipping.")
+print(f"Shape: {df.shape}")
+
+# %% Save df_targets (original string labels, before encoding)
+print("\n  Saving df_targets snapshot (original labels, before encoding)...")
+df_targets = df.copy()
+print(f"  df_targets shape: {df_targets.shape}")
+
+# %% Prepare df_imp for imputation
+print("\n" + "=" * 60)
+print("STEP 7 — Prepare df_imp (drop targets + linker_SMILES)")
+print("=" * 60)
+
+# df_imp = all columns except the last 4 targets (CP, CS, RP, RS)
+df_imp = df.iloc[:, :-4].copy()
+
+if "linker_SMILES" in df_imp.columns:
+    df_imp = df_imp.drop(columns=["linker_SMILES"])
+    print("  Dropped 'linker_SMILES' from df_imp.")
+
+print(f"  df_imp shape: {df_imp.shape}")
+print(f"  Columns: {df_imp.columns.tolist()}")
+
+# %% Label-encode categorical columns
+print("\n" + "=" * 60)
+print("STEP 8 — Label-encode categorical columns (pd.factorize)")
+print("=" * 60)
+
+df_imp = label_encode_categoricals(
+    df_imp,
+    cols=["MOF_type", "polymer_type", "space_group", "All_Metals"],
+)
+print(f"  df_imp dtypes after encoding:\n{df_imp.dtypes.to_string()}")
+
+# %% Missing value summary before imputation
+print("\n" + "=" * 60)
+print("STEP 9 — Missing value summary BEFORE imputation")
+print("=" * 60)
+
+missing_before = df_imp.isnull().sum()
+missing_before = missing_before[missing_before > 0].sort_values(ascending=False)
+total_missing = df_imp.isnull().sum().sum()
+print(f"  Total missing values: {total_missing}")
+print(f"  Columns with missing values ({len(missing_before)}):")
+for col, n in missing_before.items():
+    pct = n / len(df_imp) * 100
+    print(f"    {col}: {n} ({pct:.1f}%)")
+
+# %% Selective MICE imputation
+print("\n" + "=" * 60)
+print("STEP 10 — Selective MICE imputation (threshold: ACCETTABILE)")
+print("=" * 60)
+
+imputation_results = selective_mice_imputation(df_imp, quality_threshold="ACCETTABILE")
+
+df_selective = imputation_results["df_imputed"]
+quality_results = imputation_results["quality_results"]
+columns_imputed = imputation_results["columns_imputed"]
+columns_skipped = imputation_results["columns_skipped"]
+
+print(f"\n  Imputation summary:")
+print(f"    Columns imputed : {len(columns_imputed)}")
+print(f"    Columns skipped : {len(columns_skipped)}")
+
+# %% Drop columns with > 100 remaining missing values
+print("\n" + "=" * 60)
+print("STEP 11 — Drop columns with > 100 remaining missing values")
+print("=" * 60)
+
+remaining_missing = df_selective.isnull().sum()
+cols_to_drop = remaining_missing[remaining_missing > 100].index.tolist()
+if cols_to_drop:
+    df_selective = df_selective.drop(columns=cols_to_drop)
+    print(f"  Dropped {len(cols_to_drop)} columns: {cols_to_drop}")
+else:
+    print("  No columns exceed 100 remaining missing values.")
+print(f"  df_selective shape: {df_selective.shape}")
+
+# %% Missing value summary after imputation
+print("\n" + "=" * 60)
+print("STEP 12 — Missing value summary AFTER imputation")
+print("=" * 60)
+
+missing_after = df_selective.isnull().sum()
+missing_after = missing_after[missing_after > 0].sort_values(ascending=False)
+total_missing_after = df_selective.isnull().sum().sum()
+print(f"  Total missing values: {total_missing_after}")
+if len(missing_after) > 0:
+    print(f"  Columns still with missing values ({len(missing_after)}):")
+    for col, n in missing_after.items():
+        pct = n / len(df_selective) * 100
+        print(f"    {col}: {n} ({pct:.1f}%)")
+else:
+    print("  No remaining missing values in imputed columns.")
+
+# %% Reconstruct df_complete with original labels
+print("\n" + "=" * 60)
+print("STEP 13 — Reconstruct df_complete with original labels")
+print("=" * 60)
+
+# Add CP, CS, RP, RS back (original float values from df_targets)
+df_complete = pd.concat(
+    [df_selective, df_targets.iloc[:, -4:]], axis=1
+)
+
+# Replace encoded MOF_type and polymer_type with original string values
+# Use column-name lookup instead of positional slice to avoid mis-alignment
+# when linker_SMILES (or other columns) were dropped from df_imp before encoding
+for col in ["MOF_type", "polymer_type"]:
+    if col in df_targets.columns and col in df_complete.columns:
+        df_complete[col] = df_targets[col].values
+
+print(f"  df_complete shape: {df_complete.shape}")
+print(f"  Columns: {df_complete.columns.tolist()}")
+
+# %% Add SMILES for polymer_type
+print("\n" + "=" * 60)
+print("STEP 14 — Add polymer SMILES")
+print("=" * 60)
+
+df_complete["smiles"] = df_complete["polymer_type"].map(polymer_to_smiles_sat)
+n_mapped = df_complete["smiles"].notna().sum()
+n_total = len(df_complete)
+print(f"  Mapped SMILES for {n_mapped}/{n_total} rows "
+      f"({n_mapped / n_total * 100:.1f}% coverage).")
+
+# Unique polymers without a SMILES mapping
+unmapped = (
+    df_complete.loc[df_complete["smiles"].isna(), "polymer_type"]
+    .unique()
+    .tolist()
+)
+if unmapped:
+    print(f"  Polymer types without SMILES mapping ({len(unmapped)}): {unmapped}")
+
+# %% Final dataset summary
+print("\n" + "=" * 60)
+print("STEP 15 — Final dataset summary")
+print("=" * 60)
+
+print(f"  Final shape: {df_complete.shape}")
+print(f"\n  Dtypes:\n{df_complete.dtypes.to_string()}")
+print(f"\n  Sample (first 3 rows):\n{df_complete.head(3).to_string()}")
+
+missing_final = df_complete.isnull().sum()
+missing_final = missing_final[missing_final > 0]
+if len(missing_final) > 0:
+    print(f"\n  Remaining missing values in final dataset:")
+    for col, n in missing_final.items():
+        pct = n / len(df_complete) * 100
+        print(f"    {col}: {n} ({pct:.1f}%)")
+else:
+    print("\n  No missing values in final dataset.")
+
+# %% Save to CSV
+print("\n" + "=" * 60)
+print("STEP 16 — Save dataset.csv")
+print("=" * 60)
+
+df_complete.to_csv("../data/dataset.csv")
+print(f"  Saved: ../data/dataset.csv  ({df_complete.shape[0]} rows × {df_complete.shape[1]} cols)")
+
+_log.close()
